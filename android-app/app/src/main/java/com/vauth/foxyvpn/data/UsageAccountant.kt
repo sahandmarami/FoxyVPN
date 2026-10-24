@@ -38,6 +38,34 @@ object UsageAccountant {
         recomputeBlock(activatedKeyStore.nowMillis())
     }
 
+    /**
+     * Raises the counter to a value seen elsewhere (the distributor's gist);
+     * used to resume a friend's usage after logout or a reinstall. Monotonic.
+     */
+    fun ingestExternalUsed(bytes: Long) {
+        if (key == null || bytes <= 0L) return
+        val current = usedBytes.get()
+        if (bytes <= current) return
+        usedBytes.set(bytes)
+        store?.ingestExternalUsage(bytes)
+        recomputeBlock(System.currentTimeMillis())
+    }
+
+    /**
+     * Fire-and-forget: pull the usage this device last reported to the
+     * distributor's gist and raise the local counter to it, so a friend who
+     * signs out (or reinstalls the app) continues from where they were
+     * instead of getting their volume from zero.
+     */
+    fun seedFromGistAsync() {
+        val ctx = reporterContext ?: return
+        scope.launch {
+            runCatching { GistReporter.fetchReportedUsage(ctx) }
+                .getOrNull()
+                ?.let { ingestExternalUsed(it) }
+        }
+    }
+
     fun reset() {
         store = null
         key = null
@@ -82,6 +110,12 @@ object UsageAccountant {
 
     fun recomputeBlock(nowMillis: Long) {
         val current = key ?: return
+        // a key the registry once reported as revoked stays revoked forever,
+        // even when the gist cannot be reached again
+        if (store != null && current.keyId.isNotBlank() && store!!.isKeyRevoked(current.keyId)) {
+            blockReason = BlockReason.REVOKED
+            return
+        }
         val limit = current.payload.limitBytes
         val exp = current.payload.exp
         blockReason = when {
@@ -94,8 +128,38 @@ object UsageAccountant {
     fun markRevoked() {
         if (key == null) return
         blockReason = BlockReason.REVOKED
+        // persist the verdict so restarts and offline reconnects honour it
+        val id = key?.keyId
+        if (!id.isNullOrBlank()) store?.markKeyRevoked(id)
         store?.saveUsage(usedBytes.get())
         pushFinalStatus()
+    }
+
+    /**
+     * The registry now lists the key as active again (the distributor pressed
+     * "فعال‌سازی دوباره") — drop the local revocation verdict.
+     */
+    fun clearRevocation() {
+        val id = key?.keyId ?: return
+        val s = store ?: return
+        if (s.isKeyRevoked(id)) {
+            s.clearKeyRevoked(id)
+            if (blockReason == BlockReason.REVOKED) {
+                blockReason = BlockReason.NONE
+                recomputeBlock(System.currentTimeMillis())
+            }
+        }
+    }
+
+    /** Remembers when the account's monthly volume is re-granted. */
+    fun noteQuotaReset(resetAtEpochSeconds: Long) {
+        val id = key?.keyId ?: return
+        if (resetAtEpochSeconds > 0L) store?.saveQuotaReset(id, resetAtEpochSeconds)
+    }
+
+    fun quotaResetAt(): Long {
+        val id = key?.keyId ?: return 0L
+        return store?.quotaResetEpochSeconds(id) ?: 0L
     }
 
     /** Best-effort live report for the distributor; never throws. */

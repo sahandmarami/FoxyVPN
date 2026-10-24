@@ -4,6 +4,8 @@ import android.util.Base64
 import com.foxy.keygen.data.model.RuntimeAuth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -55,6 +57,13 @@ class FxaAuthRepository(
 
     /** Fired whenever the live session tokens change (login / refresh grant). */
     var onAuthSaved: (() -> Unit)? = null
+
+    /**
+     * Firefox rotates the refresh token on every refresh grant, so two
+     * concurrent refreshes with the same token invalidate one of them and
+     * the session dies. All refreshes are serialized through this mutex.
+     */
+    private val refreshMutex = Mutex()
 
     private fun notifyAuthSaved() {
         runCatching { onAuthSaved?.invoke() }
@@ -146,10 +155,11 @@ class FxaAuthRepository(
         }
     }
 
-    suspend fun ensureFreshAccessToken(force: Boolean = false): RuntimeAuth {
+    suspend fun ensureFreshAccessToken(force: Boolean = false): RuntimeAuth = refreshMutex.withLock {
         val current = tokenStore.loadAuth()
             ?: throw FxaRefreshFailure("Not signed in", permanent = true)
-        if (!force && tokenStore.hasValidAccessToken()) return current
+        // a concurrent caller may have refreshed while we waited on the mutex
+        if (!force && tokenStore.hasValidAccessToken()) return@withLock current
 
         val refreshToken = current.refreshToken
             ?: throw FxaRefreshFailure(
@@ -196,7 +206,7 @@ class FxaAuthRepository(
         runCatching { tokenStore.saveAuth(renewed) }
             .onFailure { AppLogger.w(TAG, "could not persist the renewed token", it) }
         notifyAuthSaved()
-        return renewed
+        return@withLock renewed
     }
 
     suspend fun currentAccessToken(): String? = try {

@@ -45,6 +45,8 @@ data class Entitlement(
     val maxBytes: Long?,
     val limitedBandwidth: Boolean,
     val quotaRemaining: Long? = null,
+    /** Unix seconds when the monthly volume is re-granted (X-Quota-Reset). */
+    val quotaReset: Long? = null,
 )
 
 data class RuntimeAuth(

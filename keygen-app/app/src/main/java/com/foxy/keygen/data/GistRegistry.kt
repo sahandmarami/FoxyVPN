@@ -30,6 +30,8 @@ class GistRegistry(context: Context) {
         val usedBytes: Long = 0L,
         val status: String = "",
         val updatedAt: Long = 0L,
+        /** E-mail of the Firefox account whose quota this key consumes. */
+        val acct: String = "",
     ) {
         /** Total plan bytes: GB entries win, otherwise MB, otherwise unlimited (0). */
         val planBytes: Long
@@ -120,13 +122,14 @@ class GistRegistry(context: Context) {
                     usedBytes = usage?.optLong("used") ?: 0L,
                     status = usage?.optString("status").orEmpty(),
                     updatedAt = usage?.optLong("updated") ?: 0L,
+                    acct = entry.optString("acct"),
                 ),
             )
         }
         rows.sortedByDescending { it.issuedAt }
     }
 
-    suspend fun addKey(row: KeyRow) = withContext(Dispatchers.IO) {
+    suspend fun addKey(row: KeyRow, mintingAccount: String = "") = withContext(Dispatchers.IO) {
         val gist = fetchGist(gistId, githubToken) ?: throw Exception("خواندن مخزن ناموفق بود")
         val registry = gist.first
         val keys = registry.optJSONArray("keys") ?: JSONArray().also { registry.put("keys", it) }
@@ -138,7 +141,8 @@ class GistRegistry(context: Context) {
                 .put("mb", row.mb)
                 .put("exp", row.exp)
                 .put("issued", row.issuedAt)
-                .put("revoked", false),
+                .put("revoked", false)
+                .put("acct", mintingAccount),
         )
         patchFile("registry.json", registry.toString())
     }
@@ -154,6 +158,37 @@ class GistRegistry(context: Context) {
             }
         }
         patchFile("registry.json", registry.toString())
+    }
+
+    /**
+     * Removes the key from the registry and its usage entry from usage.json,
+     * so the row disappears from both the keygen and the client dashboards.
+     */
+    suspend fun deleteKey(keyId: String) = withContext(Dispatchers.IO) {
+        val gist = fetchGist(gistId, githubToken) ?: throw Exception("خواندن مخزن ناموفق بود")
+        // 1) drop the row from registry.json
+        val registry = gist.first
+        val keys = registry.optJSONArray("keys") ?: JSONArray()
+        val kept = JSONArray()
+        for (i in 0 until keys.length()) {
+            val entry = keys.optJSONObject(i) ?: continue
+            if (entry.optString("id") != keyId) kept.put(entry)
+        }
+        registry.put("keys", kept)
+        if (!patchFile("registry.json", registry.toString())) {
+            throw Exception("حذف کلید از مخزن ناموفق بود")
+        }
+        // 2) drop the usage entry (best effort)
+        runCatching {
+            val usage = gist.second
+            val usages = usage.optJSONObject("usages") ?: JSONObject()
+            if (usages.has(keyId)) {
+                usages.remove(keyId)
+                usage.put("usages", usages)
+                patchFile("usage.json", usage.toString())
+            }
+        }
+        Unit
     }
 
     private fun fetchGist(id: String, token: String): Pair<JSONObject, JSONObject>? {

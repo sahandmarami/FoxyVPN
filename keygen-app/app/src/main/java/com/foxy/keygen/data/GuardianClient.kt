@@ -65,7 +65,10 @@ class GuardianClient(
 
         if (entitlement.limitedBandwidth) {
             val pass = runCatching { fetchProxyPass(endpoint, accessToken) }.getOrNull()
-            entitlement.copy(quotaRemaining = pass?.quotaRemaining ?: entitlement.quotaRemaining)
+            entitlement.copy(
+                quotaRemaining = pass?.quotaRemaining ?: entitlement.quotaRemaining,
+                quotaReset = pass?.quotaReset ?: entitlement.quotaReset,
+            )
         } else {
             entitlement
         }
@@ -93,6 +96,25 @@ class GuardianClient(
         },
         limitedBandwidth = body.optBoolean("limited_bandwidth", false),
     )
+
+    /**
+     * Account status + the metered-quota headers of a fresh proxy pass.
+     * [Entitlement.quotaReset] carries the moment the monthly volume is
+     * re-granted (unix seconds) so the dashboard can show the recharge day.
+     */
+    suspend fun fetchAccountOverview(endpoint: String, accessToken: String): Entitlement = withContext(Dispatchers.IO) {
+        val entitlement = fetchUserInfo(endpoint, accessToken)
+        if (entitlement.quotaRemaining != null && entitlement.quotaReset != null) {
+            entitlement
+        } else {
+            val pass = runCatching { fetchProxyPass(endpoint, accessToken) }.getOrNull()
+                ?: return@withContext entitlement
+            entitlement.copy(
+                quotaRemaining = entitlement.quotaRemaining ?: pass.quotaRemaining,
+                quotaReset = entitlement.quotaReset ?: pass.quotaReset,
+            )
+        }
+    }
 
     private suspend fun authorizedRequest(method: String, url: String, accessToken: String): Response {
         fun buildRequest(): Request {

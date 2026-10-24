@@ -48,6 +48,8 @@ object GistReporter {
     /** Result of a combined revocation-check + usage-report round trip. */
     data class SyncResult(
         val revoked: Boolean,
+        /** True when the registry answered and contained this key. */
+        val present: Boolean,
         val reported: Boolean,
     )
 
@@ -70,10 +72,12 @@ object GistReporter {
                 return@withContext null
             }
             var revoked = false
+            var present = false
             gist.first.optJSONArray("keys")?.let { keys ->
                 for (i in 0 until keys.length()) {
                     val entry = keys.optJSONObject(i) ?: continue
                     if (entry.optString("id") == ctx.keyId) {
+                        present = true
                         revoked = entry.optBoolean("revoked", false)
                         break
                     }
@@ -87,26 +91,46 @@ object GistReporter {
             }
             val reported = patchUsage(gist.second, ctx, usedBytes, status)
             if (!reported) AppLogger.d(TAG, "gist sync: usage patch failed (will retry)")
-            SyncResult(revoked = revoked, reported = reported)
+            SyncResult(revoked = revoked, present = present, reported = reported)
         } finally {
             inFlight.set(false)
         }
     }
 
-    /** Returns true when the registry marks this key as revoked. */
+    /**
+     * True when the registry (reachable!) marks this key revoked or no longer
+     * lists it at all — the distributor deleted it. False when the gist could
+     * not be reached: being offline must not brick the key.
+     */
     suspend fun isRevoked(ctx: ReportContext): Boolean = withContext(Dispatchers.IO) {
         runCatching {
             val pair = fetchGist(ctx.gistId, ctx.token) ?: return@runCatching false
             val keys = pair.first.optJSONArray("keys") ?: return@runCatching false
             for (i in 0 until keys.length()) {
                 val entry = keys.optJSONObject(i) ?: continue
-                if (entry.optString("id") == ctx.keyId) return@runCatching entry.optBoolean("revoked", false)
+                if (entry.optString("id") == ctx.keyId) {
+                    return@runCatching entry.optBoolean("revoked", false)
+                }
             }
-            false
+            // the registry answered but does not know this key: it was deleted
+            true
         }.getOrElse {
             AppLogger.d(TAG, "revocation check failed (treating as not revoked): ${it.message}")
             false
         }
+    }
+
+    /**
+     * The usage this device last reported for the key — used to resume the
+     * counter after logout or a reinstall.
+     */
+    suspend fun fetchReportedUsage(ctx: ReportContext): Long? = withContext(Dispatchers.IO) {
+        runCatching {
+            val gist = fetchGist(ctx.gistId, ctx.token) ?: return@runCatching null
+            gist.second.optJSONObject("usages")?.optJSONObject(ctx.keyId)
+                ?.optLong("used", 0L)
+                ?.takeIf { it > 0L }
+        }.getOrNull()
     }
 
     /**

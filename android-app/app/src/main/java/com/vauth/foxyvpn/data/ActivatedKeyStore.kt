@@ -6,10 +6,14 @@ import org.json.JSONObject
 /**
  * Persists the activated quota key and the cumulative usage counter.
  *
- * Usage is written to two independent places (two SharedPreferences files);
- * on load the larger value wins, so deleting or editing only one of them does
- * not reset the counter. A monotonic wall-clock floor is also stored to blunt
- * simple clock-rollback tricks against time-limited keys.
+ * Usage survives logout and re-activation: every counter is written to a
+ * per-key ledger (`foxyvpn_usage_ledger`, keyed by key id) that no sign-out
+ * ever touches, plus the two historic mirror files for the active key. On
+ * load the largest value wins, so deleting or editing one of them does not
+ * reset the counter. A revocation tombstone and the monthly quota-reset
+ * timestamp are kept in the ledger file as well, so a key that the
+ * distributor has revoked stays revoked even when the gist cannot be
+ * reached, and the client can show the recharge countdown offline.
  */
 class ActivatedKeyStore(context: Context) {
 
@@ -20,9 +24,16 @@ class ActivatedKeyStore(context: Context) {
 
     private val mainPrefs = context.getSharedPreferences("foxyvpn_key", Context.MODE_PRIVATE)
     private val mirrorPrefs = context.getSharedPreferences("foxyvpn_key_guard", Context.MODE_PRIVATE)
+    private val ledgerPrefs = context.getSharedPreferences("foxyvpn_usage_ledger", Context.MODE_PRIVATE)
 
     var activatedKey: QuotaKey? = null
         private set
+
+    private fun keyId(): String? = try {
+        activatedKey?.keyId ?: loadKey()?.keyId
+    } catch (e: Exception) {
+        null
+    }
 
     fun saveKey(key: QuotaKey) {
         val obj = JSONObject()
@@ -48,20 +59,33 @@ class ActivatedKeyStore(context: Context) {
         }.onFailure { AppLogger.w(TAG, "stored key unreadable", it) }.getOrNull()
     }
 
+    /**
+     * Forgets the active key only. The per-key usage ledger, the revocation
+     * tombstones and the reset timestamps deliberately survive, so re-adding
+     * the same key resumes the counter instead of starting from zero.
+     */
     fun clear() {
         mainPrefs.edit().clear().apply()
         mirrorPrefs.edit().clear().apply()
         activatedKey = null
     }
 
-    // ---------- usage ----------
+    // ---------- usage (per-key ledger + legacy mirrors) ----------
 
     fun loadUsage(): UsageState {
+        val currentId = keyId()
+        val mirror = loadMirrorUsage()
+        if (currentId == null) return mirror
+        val ledger = ledgerUsage(currentId)
+        val best = if (mirror.usedBytes >= ledger.usedBytes) mirror else ledger
+        return UsageState(best.usedBytes, maxOf(best.lastSeenClock, ledger.lastSeenClock, mirror.lastSeenClock))
+    }
+
+    private fun loadMirrorUsage(): UsageState {
         val a = readUsage(mainPrefs)
         val b = readUsage(mirrorPrefs)
         val best = if (a.usedBytes >= b.usedBytes) a else b
-        val clockFloor = maxOf(a.lastSeenClock, b.lastSeenClock)
-        return UsageState(best.usedBytes, clockFloor)
+        return UsageState(best.usedBytes, maxOf(a.lastSeenClock, b.lastSeenClock))
     }
 
     private fun readUsage(prefs: android.content.SharedPreferences): UsageState = UsageState(
@@ -75,11 +99,66 @@ class ActivatedKeyStore(context: Context) {
         val clock = maxOf(nowMillis, current.lastSeenClock)
         writeUsage(mainPrefs, used, clock)
         writeUsage(mirrorPrefs, used, clock)
+        keyId()?.let { saveLedgerUsage(it, used, clock) }
     }
 
     private fun writeUsage(prefs: android.content.SharedPreferences, used: Long, clock: Long) {
         prefs.edit().putLong(KEY_USED, used).putLong(KEY_LAST_SEEN, clock).apply()
     }
+
+    private fun ledgerUsage(keyId: String): UsageState = UsageState(
+        usedBytes = ledgerPrefs.getLong(KEY_LEDGER_USED + keyId, 0L).coerceAtLeast(0L),
+        lastSeenClock = ledgerPrefs.getLong(KEY_LEDGER_CLOCK + keyId, 0L),
+    )
+
+    /** Monotonic: the ledger never goes backwards for a given key. */
+    private fun saveLedgerUsage(keyId: String, usedBytes: Long, nowMillis: Long) {
+        val current = ledgerUsage(keyId)
+        val used = maxOf(usedBytes, current.usedBytes)
+        val clock = maxOf(nowMillis, current.lastSeenClock)
+        ledgerPrefs.edit()
+            .putLong(KEY_LEDGER_USED + keyId, used)
+            .putLong(KEY_LEDGER_CLOCK + keyId, clock)
+            .apply()
+    }
+
+    /** Raises the stored counter for the active key (gist seeding). */
+    fun ingestExternalUsage(usedBytes: Long) {
+        val id = keyId() ?: return
+        saveLedgerUsage(id, usedBytes, System.currentTimeMillis())
+        if (id == keyId()) {
+            val mirror = loadMirrorUsage()
+            if (usedBytes > mirror.usedBytes) {
+                writeUsage(mainPrefs, usedBytes, mirror.lastSeenClock)
+                writeUsage(mirrorPrefs, usedBytes, mirror.lastSeenClock)
+            }
+        }
+    }
+
+    // ---------- revocation tombstone ----------
+
+    /** A key the registry once reported as revoked stays dead — even offline. */
+    fun markKeyRevoked(keyId: String) {
+        ledgerPrefs.edit().putBoolean(KEY_REVOKED + keyId, true).apply()
+    }
+
+    fun isKeyRevoked(keyId: String): Boolean =
+        ledgerPrefs.getBoolean(KEY_REVOKED + keyId, false)
+
+    /** The distributor re-enabled the key — drop the tombstone. */
+    fun clearKeyRevoked(keyId: String) {
+        ledgerPrefs.edit().remove(KEY_REVOKED + keyId).apply()
+    }
+
+    // ---------- monthly quota reset timestamp ----------
+
+    fun saveQuotaReset(keyId: String, resetAtEpochSeconds: Long) {
+        if (resetAtEpochSeconds <= 0L) return
+        ledgerPrefs.edit().putLong(KEY_RESET + keyId, resetAtEpochSeconds).apply()
+    }
+
+    fun quotaResetEpochSeconds(keyId: String): Long =
+        ledgerPrefs.getLong(KEY_RESET + keyId, 0L)
 
     /** Effective "now", resistant to backwards clock changes. */
     fun nowMillis(): Long = maxOf(System.currentTimeMillis(), loadUsage().lastSeenClock)
@@ -89,6 +168,10 @@ class ActivatedKeyStore(context: Context) {
         private const val KEY_BLOB = "key_blob"
         private const val KEY_USED = "used_bytes"
         private const val KEY_LAST_SEEN = "last_seen_clock"
+        private const val KEY_LEDGER_USED = "used_"
+        private const val KEY_LEDGER_CLOCK = "clock_"
+        private const val KEY_REVOKED = "revoked_"
+        private const val KEY_RESET = "reset_"
     }
 }
 

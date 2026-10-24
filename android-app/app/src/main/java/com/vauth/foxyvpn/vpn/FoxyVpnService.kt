@@ -115,7 +115,7 @@ private const val WIFI_LOCK_TAG = "com.vauth.foxyvpn:vpn-wifi"
 private const val KEY_SUPERVISION_TICK_MS = 2_000L
 
 /** One gist round trip per interval: revocation check + live usage report. */
-private const val KEY_GIST_SYNC_INTERVAL_MS = 30_000L
+private const val KEY_GIST_SYNC_INTERVAL_MS = 20_000L
 
 /** Revocation re-check budget before opening a new tunnel. */
 private const val CONNECT_GIST_CHECK_TIMEOUT_MS = 8_000L
@@ -727,6 +727,11 @@ class FoxyVpnService : VpnService() {
                 if (pass.quotaMax != null) {
                     settingsStore.cachedQuotaMax = pass.quotaMax
                 }
+                if (pass.quotaReset != null) {
+                    // the moment the friend's monthly volume is re-granted;
+                    // shown as a countdown on the home screen
+                    UsageAccountant.noteQuotaReset(pass.quotaReset!!)
+                }
                 return pass
             }
 
@@ -1219,10 +1224,18 @@ class FoxyVpnService : VpnService() {
                             }.onFailure {
                                 AppLogger.d(TAG, "gist sync failed this tick: ${it.message}")
                             }.getOrNull()
-                            if (sync?.revoked == true) {
+                            if (sync?.revoked == true || (sync != null && !sync.present)) {
+                                // revoked, or dropped from the registry entirely
+                                if (sync != null && !sync.present) {
+                                    AppLogger.w(TAG, "gist registry no longer lists this key; treating as revoked")
+                                }
                                 AppLogger.w(TAG, "gist registry marks this key revoked; disconnecting")
                                 UsageAccountant.markRevoked()
                                 continue
+                            }
+                            if (sync?.present == true && !sync.revoked) {
+                                // the distributor re-enabled the key
+                                UsageAccountant.clearRevocation()
                             }
                         }
                     }

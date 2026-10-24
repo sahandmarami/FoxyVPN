@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vauth.foxyvpn.FoxyVpnApp
+import com.vauth.foxyvpn.data.FaFormat
 import com.vauth.foxyvpn.data.QuotaKeyPayload
 import com.vauth.foxyvpn.data.UsageAccountant
 import com.vauth.foxyvpn.data.formatBytes
@@ -472,8 +473,10 @@ private fun AccountCard(
                         color = accentDeep,
                     )
                     if (expiresAt > 0) {
+                        val expired = expiresAt * 1000L <= nowMs
                         Text(
-                            remainingLabel(expiresAt, nowMs),
+                            if (expired) "اعتبار تمام شده"
+                            else FaFormat.remainingLabel(expiresAt, nowMs) + " باقی‌مانده",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = if (expiresAt * 1000L > nowMs) accentDeep else Color(0xFFB72749),
@@ -482,11 +485,22 @@ private fun AccountCard(
                 }
                 if (expiresAt > 0) {
                     Text(
-                        "تا " + formatDate(expiresAt),
+                        "تا " + FaFormat.formatJalaliDate(expiresAt),
                         fontSize = 11.sp,
                         color = Color(0xFF7A8794),
                     )
                 }
+            }
+
+            val resetAt = remember(nowMs) { UsageAccountant.quotaResetAt() }
+            if (resetAt > 0) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    FaFormat.quotaResetLabel(resetAt, nowMs),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF67737F),
+                )
             }
 
             val planBytes = planGb * QuotaKeyPayload.BYTES_PER_GB + planMb * QuotaKeyPayload.BYTES_PER_MB
@@ -654,29 +668,3 @@ private fun shortDuration(seconds: Long): String {
     return if (h > 0) "${h}h ${m}m" else "${m}m"
 }
 
-private fun formatDate(epochSeconds: Long): String = runCatching {
-    val formatter = DateTimeFormatter.ofPattern("d MMMM yyyy", Locale("fa"))
-    formatter.format(Instant.ofEpochSecond(epochSeconds).atZone(ZoneId.systemDefault()).toLocalDate())
-}.getOrDefault("")
-
-/** Persian digit rendering for the countdown numbers. */
-private fun faDigits(n: Long): String = buildString {
-    for (ch in n.toString()) append(if (ch in '0'..'9') ('۰'.code + (ch - '0')) else ch)
-}
-
-/**
- * Human "time left on the key" label, recalculated live so the day count
- * drops on its own as days pass.
- */
-private fun remainingLabel(expiresAtEpochSec: Long, nowMillis: Long): String {
-    val remainingMs = expiresAtEpochSec * 1000L - nowMillis
-    if (remainingMs <= 0L) return "اعتبار تمام شده"
-    val totalMinutes = remainingMs / 60_000L
-    val hours = totalMinutes / 60
-    val days = hours / 24
-    return when {
-        days >= 1 -> "${faDigits(days)} روز باقی‌مانده"
-        hours >= 1 -> "${faDigits(hours)} ساعت باقی‌مانده"
-        else -> "کمتر از یک ساعت باقی‌مانده"
-    }
-}

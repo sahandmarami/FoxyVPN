@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VpnKey
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -53,11 +54,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -76,6 +79,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.foxy.keygen.data.AccountVault
 import com.foxy.keygen.data.ControlPlaneHttp
+import com.foxy.keygen.data.FaFormat
 import com.foxy.keygen.data.FxaAuthRepository
 import com.foxy.keygen.data.GistRegistry
 import com.foxy.keygen.data.QuotaKeyCodec
@@ -88,10 +92,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -215,6 +215,10 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
             onClick = {
                 busy = true; error = null
                 scope.launch {
+                    // while the fresh login owns the live TokenStore, the vault
+                    // must NOT mirror it into the previously active account —
+                    // that is what swapped the two accounts' tokens in v1.2.0
+                    app.accountVault.beginNewLogin()
                     try {
                         if (needCode) {
                             app.authRepository.submitTwoFactorCode(code).getOrThrow()
@@ -223,14 +227,16 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
                             if (needsTwoFactor) {
                                 needCode = true
                                 busy = false
+                                app.accountVault.endNewLogin()
                                 return@launch
                             }
                         }
                         // record the account in the multi-account vault
                         val auth = app.tokenStore.loadAuth()
                         val realEmail = auth?.let { fetchFxaProfileEmail(it.accessToken) }
-                        val label = realEmail
+                        val identity = realEmail
                             ?: FxaAuthRepository.normalizeEmail(email).takeIf { it.isNotBlank() }
+                        val label = identity
                             ?: "اکانت ${app.accountVault.accounts.size + 1}"
                         app.accountVault.upsert(
                             AccountVault.StoredAccount(
@@ -239,12 +245,16 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
                                 refreshToken = auth?.refreshToken,
                                 expiresAtEpochSeconds = auth?.expiresAtEpochSeconds ?: 0L,
                                 addedAtEpochSeconds = System.currentTimeMillis() / 1000L,
+                                pendingIdentity = identity == null,
                             ),
                         )
+                        app.accountVault.endNewLogin()
                         onSignedIn()
                     } catch (c: CancellationException) {
+                        app.accountVault.endNewLogin()
                         throw c
                     } catch (e: Exception) {
+                        app.accountVault.endNewLogin()
                         error = e.message?.take(240) ?: "ورود ناموفق بود"
                     } finally {
                         busy = false
@@ -262,6 +272,41 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
     }
 }
 
+/**
+ * Activates [email] in the vault and revives its stored FxA session before
+ * any screen keeps using it. Returns null on success or a Persian error.
+ */
+suspend fun switchAccount(app: KeygenApp, email: String): String? {
+    return withContext(Dispatchers.IO) {
+        if (!app.accountVault.activateInto(app.tokenStore, email)) {
+            return@withContext "این اکانت در لیست نیست"
+        }
+        val status = try {
+            app.authRepository.restoreSession()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            com.foxy.keygen.data.AppLogger.w("AccountSwitch", "restore failed for $email", e)
+            null
+        }
+        when (status) {
+            // ok: the live session belongs to this account now
+            com.foxy.keygen.data.SessionStatus.ACTIVE -> {
+                app.accountVault.clearBroken(email)
+                app.accountVault.syncActiveFrom(app.tokenStore)
+                null
+            }
+            com.foxy.keygen.data.SessionStatus.UNREACHABLE -> null // keep the account; tokens may still work
+            else -> {
+                // the stored session of this account is dead — the user must
+                // sign in to it again; stay on it so the fresh login lands here
+                app.accountVault.markBroken(email)
+                "نشست این اکانت باطل شده است؛ دوباره واردش شوید"
+            }
+        }
+    }
+}
+
 // ---------------- home ----------------
 
 @Composable
@@ -273,8 +318,11 @@ private fun HomeScreen(
     onSignOutActive: () -> Unit,
 ) {
     val accent = rememberKeygenAccent()
+    val scope = rememberCoroutineScope()
     var tab by remember { mutableIntStateOf(0) }
     var menuOpen by remember { mutableStateOf(false) }
+    var switching by remember { mutableStateOf(false) }
+    var switchError by remember { mutableStateOf<String?>(null) }
 
     val accounts = remember(accountsVersion) { app.accountVault.accounts }
     val activeEmail = remember(accountsVersion) { app.accountVault.activeAccount()?.email.orEmpty() }
@@ -298,25 +346,41 @@ private fun HomeScreen(
                         onClick = { menuOpen = true },
                         shape = RoundedCornerShape(50),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF17222C)),
+                        enabled = !switching,
                     ) {
-                        Icon(Icons.Filled.People, contentDescription = null, modifier = Modifier.size(16.dp), tint = accent)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            if (accounts.size > 1) "${faDigits(accounts.size.toLong())} اکانت" else (activeEmail.ifBlank { "اکانت" }).take(22),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
+                        if (switching) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = accent)
+                        } else {
+                            Icon(Icons.Filled.People, contentDescription = null, modifier = Modifier.size(16.dp), tint = accent)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                // the vault is deduped now, so this count is honest
+                                if (accounts.size > 1) "${FaFormat.faDigits(accounts.size)} اکانت"
+                                else (activeEmail.ifBlank { "اکانت" }).take(22),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         accounts.forEach { account ->
                             DropdownMenuItem(
                                 text = {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(
-                                            account.email,
-                                            fontSize = 12.sp,
-                                            fontWeight = if (account.email == activeEmail) FontWeight.Bold else FontWeight.Normal,
-                                        )
+                                        Column {
+                                            Text(
+                                                account.email,
+                                                fontSize = 12.sp,
+                                                fontWeight = if (account.email == activeEmail) FontWeight.Bold else FontWeight.Normal,
+                                            )
+                                            if (app.accountVault.isBroken(account.email)) {
+                                                Text(
+                                                    "نشست باطل شده — دوباره وارد شوید",
+                                                    fontSize = 10.sp,
+                                                    color = Color(0xFFB72749),
+                                                )
+                                            }
+                                        }
                                         Spacer(Modifier.weight(1f))
                                         if (account.email == activeEmail) {
                                             Icon(Icons.Filled.Check, contentDescription = "فعال", tint = accent, modifier = Modifier.size(16.dp))
@@ -324,9 +388,16 @@ private fun HomeScreen(
                                     }
                                 },
                                 onClick = {
-                                    app.accountVault.activateInto(app.tokenStore, account.email)
                                     menuOpen = false
-                                    onAccountsChanged()
+                                    if (account.email != activeEmail && !switching) {
+                                        switching = true
+                                        switchError = null
+                                        scope.launch {
+                                            switchError = switchAccount(app, account.email)
+                                            switching = false
+                                            onAccountsChanged()
+                                        }
+                                    }
                                 },
                             )
                         }
@@ -338,7 +409,7 @@ private fun HomeScreen(
                         )
                         DropdownMenuItem(
                             text = { Text("خروج از اکانت فعال", fontSize = 12.sp) },
-                            leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color(0xFFB72749)) },
+                            leadingIcon = { Icon(Icons.Filled.Logout, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color(0xFFB72749)) },
                             onClick = { menuOpen = false; onSignOutActive() },
                         )
                     }
@@ -347,7 +418,7 @@ private fun HomeScreen(
         },
     ) { padding ->
         Column(Modifier.padding(padding)) {
-            AccountQuotaCard(app, accountsVersion)
+            AccountQuotaCard(app, accountsVersion, switchError)
             TabRow(
                 selectedTabIndex = tab,
                 containerColor = Color.Transparent,
@@ -362,26 +433,53 @@ private fun HomeScreen(
 }
 
 @Composable
-private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int) {
+private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: String?) {
     val accent = rememberKeygenAccent()
     val activeEmail = remember(accountsVersion) { app.accountVault.activeAccount()?.email.orEmpty() }
     var maxBytes by remember { mutableStateOf<Long?>(null) }
     var remaining by remember { mutableStateOf<Long?>(null) }
+    var resetAt by remember { mutableStateOf<Long?>(null) }
     var err by remember { mutableStateOf(false) }
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    // live clock so the recharge countdown falls on its own
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000L)
+            nowMs = System.currentTimeMillis()
+        }
+    }
 
     LaunchedEffect(activeEmail) {
+        var first = true
         while (true) {
             app.accountVault.syncActiveFrom(app.tokenStore)
-            val token = app.authRepository.currentAccessToken()
+            val token = runCatching { app.authRepository.currentAccessToken() }.getOrNull()
             if (token != null) {
-                runCatching { app.guardianClient.fetchUserInfo(KeygenApp.GUARDIAN_ENDPOINT, token) }
-                    .onSuccess {
-                        maxBytes = it.maxBytes
-                        remaining = it.quotaRemaining
+                runCatching { app.guardianClient.fetchAccountOverview(KeygenApp.GUARDIAN_ENDPOINT, token) }
+                    .onSuccess { info ->
+                        maxBytes = info.maxBytes
+                        remaining = info.quotaRemaining
+                        resetAt = info.quotaReset
                         err = false
+                        // the active row may still carry a placeholder label —
+                        // resolve its real e-mail once and merge duplicates
+                        val active = app.accountVault.activeAccount()
+                        if (active != null && active.pendingIdentity) {
+                            val real = fetchFxaProfileEmail(token)
+                            if (!real.isNullOrBlank()) {
+                                app.accountVault.applyRealEmail(active.email, real)
+                            }
+                        }
                     }
-                    .onFailure { err = true }
+                    .onFailure {
+                        // a dead session means this account must be re-added
+                        err = true
+                    }
+            } else if (first) {
+                err = true
             }
+            first = false
             delay(60_000L)
         }
     }
@@ -403,7 +501,7 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int) {
             Spacer(Modifier.height(4.dp))
             Text(
                 text = when {
-                    err -> "دریافت اطلاعات ناموفق"
+                    err -> "دریافت اطلاعات ناموفق — اتصال یا نشست اکانت را بررسی کنید"
                     remaining != null && maxBytes != null -> "${formatBytes(remaining!!)} از ${formatBytes(maxBytes!!)} باقی مانده"
                     remaining != null -> "${formatBytes(remaining!!)} باقی مانده"
                     else -> "…"
@@ -420,6 +518,19 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int) {
                     color = accent,
                     trackColor = Color(0xFFEDF1F5),
                 )
+            }
+            resetAt?.let { reset ->
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    FaFormat.quotaResetLabel(reset, nowMs),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF67737F),
+                )
+            }
+            switchError?.let { message ->
+                Spacer(Modifier.height(6.dp))
+                Text(message, fontSize = 11.sp, color = Color(0xFFB72749), fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -652,6 +763,7 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                                         issuedAt = System.currentTimeMillis() / 1000L,
                                         revoked = false,
                                     ),
+                                    mintingAccount = activeAccountEmail,
                                 )
                                 issuedKey = key
                             } catch (c: CancellationException) {
@@ -746,6 +858,7 @@ private fun KeysTab(app: KeygenApp) {
     var loading by remember { mutableStateOf(false) }
     var err by remember { mutableStateOf<String?>(null) }
     var busyId by remember { mutableStateOf<String?>(null) }
+    var deleteTarget by remember { mutableStateOf<GistRegistry.KeyRow?>(null) }
 
     fun refresh() {
         scope.launch {
@@ -816,16 +929,68 @@ private fun KeysTab(app: KeygenApp) {
                             }
                         }
                     },
+                    onDelete = { deleteTarget = row },
                 )
             }
         }
         Spacer(Modifier.height(20.dp))
     }
+
+    deleteTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("حذف کامل کاربر", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "کلید «${target.name}» به‌طور کامل حذف می‌شود؛ نه در فهرست کلیدها می‌ماند و نه مصرفش دیده می‌شود. این کار برگشت‌پذیر نیست.",
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val row = target
+                        deleteTarget = null
+                        busyId = row.id
+                        scope.launch {
+                            try {
+                                app.gistRegistry.deleteKey(row.id)
+                                refresh()
+                            } catch (c: CancellationException) {
+                                throw c
+                            } catch (e: Exception) {
+                                err = e.message
+                            } finally {
+                                busyId = null
+                            }
+                        }
+                    },
+                ) {
+                    Text("حذف کن", color = Color(0xFFB72749), fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("بی‌خیال") }
+            },
+        )
+    }
 }
 
 @Composable
-private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> Unit) {
+private fun KeyRowCard(
+    row: GistRegistry.KeyRow,
+    busy: Boolean,
+    onToggle: () -> Unit,
+    onDelete: () -> Unit,
+) {
     val accent = rememberKeygenAccent()
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000L)
+            nowMs = System.currentTimeMillis()
+        }
+    }
     val statusColor = when {
         row.revoked -> Color(0xFFB72749)
         row.status == "exhausted" -> Color(0xFFB72749)
@@ -854,6 +1019,14 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
                     Text(statusText, modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp), fontSize = 11.sp, color = statusColor, fontWeight = FontWeight.SemiBold)
                 }
             }
+            if (row.acct.isNotBlank()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "سهمیه از اکانت ${row.acct}",
+                    fontSize = 10.sp,
+                    color = Color(0xFF97A1AC),
+                )
+            }
             Spacer(Modifier.height(6.dp))
             Text(
                 buildString {
@@ -865,8 +1038,12 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
                         },
                     )
                     if (row.exp > 0) {
-                        append("  ·  اعتبار تا " + formatDate(row.exp))
-                        append("  ·  " + remainingLabel(row.exp, System.currentTimeMillis()))
+                        append("  ·  اعتبار تا " + FaFormat.formatJalaliDate(row.exp))
+                        if (row.exp * 1000L > nowMs) {
+                            append("  ·  " + FaFormat.remainingLabel(row.exp, nowMs) + " مانده")
+                        } else {
+                            append("  ·  اعتبار تمام شده")
+                        }
                     }
                 },
                 fontSize = 11.sp,
@@ -889,17 +1066,30 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
                 )
             }
             Spacer(Modifier.height(8.dp))
-            OutlinedButton(
-                onClick = onToggle,
-                enabled = !busy,
-                shape = RoundedCornerShape(10.dp),
-            ) {
-                Text(if (row.revoked) "فعال‌سازی دوباره" else "باطل‌کردن کلید", fontSize = 12.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(
+                    onClick = onToggle,
+                    enabled = !busy,
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Text(if (row.revoked) "فعال‌سازی دوباره" else "باطل‌کردن کلید", fontSize = 12.sp)
+                }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(
+                    onClick = onDelete,
+                    enabled = !busy,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFB72749)),
+                ) {
+                    Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("حذف کاربر", fontSize = 12.sp)
+                }
             }
             if (!row.revoked) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "باطل‌سازی تا حدود یک دقیقه بعد روی گوشی کاربر اعمال می‌شود",
+                    "باطل‌سازی تا حدود نیم دقیقه بعد روی گوشی کاربر اعمال می‌شود",
                     fontSize = 10.sp,
                     color = Color(0xFF97A1AC),
                 )
@@ -908,31 +1098,9 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
     }
 }
 
-private fun formatDate(epochSeconds: Long): String = runCatching {
-    DateTimeFormatter.ofPattern("d MMM yyyy", Locale("fa"))
-        .format(Instant.ofEpochSecond(epochSeconds).atZone(ZoneId.systemDefault()).toLocalDate())
-}.getOrDefault("")
-
-/** Persian digits for the day/hour countdown. */
-private fun faDigits(n: Long): String = buildString {
-    for (ch in n.toString()) append(if (ch in '0'..'9') ('۰'.code + (ch - '0')) else ch)
-}
-
-/** "چند روز تا تمدید/پایان اعتبار این کلید باقی است" — recalculated live. */
-private fun remainingLabel(expiresAtEpochSec: Long, nowMillis: Long): String {
-    val remainingMs = expiresAtEpochSec * 1000L - nowMillis
-    if (remainingMs <= 0L) return "اعتبار تمام شده"
-    val totalMinutes = remainingMs / 60_000L
-    val hours = totalMinutes / 60
-    val days = hours / 24
-    return when {
-        days >= 1 -> "${faDigits(days)} روز تا تمدید"
-        hours >= 1 -> "${faDigits(hours)} ساعت تا تمدید"
-        else -> "کمتر از یک ساعت تا تمدید"
-    }
-}
-
 private fun formatTime(epochSeconds: Long): String = runCatching {
-    DateTimeFormatter.ofPattern("HH:mm", Locale.US)
-        .format(Instant.ofEpochSecond(epochSeconds).atZone(ZoneId.systemDefault()))
+    java.time.format.DateTimeFormatter.ofPattern("HH:mm", java.util.Locale.US)
+        .format(java.time.Instant.ofEpochSecond(epochSeconds).atZone(java.time.ZoneId.systemDefault()))
 }.getOrDefault("")
+
+

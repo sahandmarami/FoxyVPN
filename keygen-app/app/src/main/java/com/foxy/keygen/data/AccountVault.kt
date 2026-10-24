@@ -15,6 +15,13 @@ private const val TAG = "AccountVault"
  * from. The tokens live in an encrypted preference file; the account that is
  * currently "active" is mirrored into [TokenStore] because FxaAuthRepository,
  * GuardianClient and the mint flow all operate on the active session.
+ *
+ * Concurrency contract (this is what kept the previous release broken):
+ *  - while a *new* login is in flight the live TokenStore belongs to the
+ *    account being signed in, NOT to the vault's active account — so
+ *    [syncActiveFrom] must stay silent ([beginNewLogin]/[endNewLogin]).
+ *  - the vault is the single source of truth; accounts are keyed by their
+ *    real e-mail and never duplicated.
  */
 class AccountVault(context: Context) {
 
@@ -24,6 +31,8 @@ class AccountVault(context: Context) {
         val refreshToken: String?,
         val expiresAtEpochSeconds: Long,
         val addedAtEpochSeconds: Long = 0L,
+        /** True while the real e-mail could not be resolved yet. */
+        val pendingIdentity: Boolean = false,
     )
 
     private val masterKey = MasterKey.Builder(context)
@@ -38,6 +47,14 @@ class AccountVault(context: Context) {
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
     )
 
+    /** True while a fresh (add-account) login owns the live TokenStore. */
+    @Volatile
+    var loginInProgress: Boolean = false
+        private set
+
+    /** E-mails whose FxA refresh was permanently rejected this session. */
+    val brokenEmails = mutableSetOf<String>()
+
     val accounts: List<StoredAccount>
         get() = runCatching {
             val arr = JSONArray(prefs.getString(KEY_ACCOUNTS, "[]").orEmpty())
@@ -49,8 +66,9 @@ class AccountVault(context: Context) {
                     refreshToken = o.optString("refresh").takeIf { it.isNotBlank() },
                     expiresAtEpochSeconds = o.optLong("expires"),
                     addedAtEpochSeconds = o.optLong("added"),
+                    pendingIdentity = o.optBoolean("pending", false),
                 )
-            }
+            }.let(::dedupe)
         }.getOrElse { emptyList() }
 
     var activeEmail: String
@@ -62,13 +80,21 @@ class AccountVault(context: Context) {
 
     val isEmpty: Boolean get() = accounts.isEmpty()
 
-    /** Adds (or replaces) an account and makes it the active one. */
+    fun beginNewLogin() { loginInProgress = true }
+    fun endNewLogin() { loginInProgress = false }
+
+    /**
+     * Adds (or replaces) an account and makes it the active one. Replaces an
+     * existing row with the same identity, so re-adding an account never
+     * duplicates it.
+     */
     fun upsert(account: StoredAccount) {
         val email = account.email.trim().lowercase()
         if (email.isBlank()) return
         val rest = accounts.filterNot { it.email == email }
         val updated = listOf(account.copy(email = email)) + rest
         persist(updated)
+        if (email in brokenEmails) brokenEmails.remove(email)
         activeEmail = email
     }
 
@@ -96,12 +122,42 @@ class AccountVault(context: Context) {
         val email = email.trim().lowercase()
         val rest = accounts.filterNot { it.email == email }
         persist(rest)
+        brokenEmails.remove(email)
         if (activeEmail == email) {
             activeEmail = rest.firstOrNull()?.email.orEmpty()
         }
     }
 
-    /** Copies the tokens of the active account into the live [TokenStore]. */
+    /**
+     * The freshly fetched real e-mail for the account currently labelled
+     * [currentEmail]: renames the row, merges it with any duplicate and keeps
+     * the active pointer consistent.
+     */
+    fun applyRealEmail(currentEmail: String, realEmail: String) {
+        val real = realEmail.trim().lowercase()
+        if (real.isBlank()) return
+        val current = currentEmail.trim().lowercase()
+        val list = accounts
+        val row = list.firstOrNull { it.email == current } ?: return
+        if (row.email == real && !row.pendingIdentity) return
+        val merged = row.copy(email = real, pendingIdentity = false)
+        val updated = listOf(merged) + list.filterNot {
+            it.email == current || it.email == real
+        }
+        persist(updated)
+        if (activeEmail == current) activeEmail = real
+    }
+
+    fun markBroken(email: String) {
+        val email = email.trim().lowercase()
+        if (email.isNotBlank()) brokenEmails.add(email)
+    }
+
+    fun clearBroken(email: String) { brokenEmails.remove(email.trim().lowercase()) }
+
+    fun isBroken(email: String): Boolean = brokenEmails.contains(email.trim().lowercase())
+
+    /** Copies the tokens of [email] into the live [TokenStore]. */
     fun activateInto(tokenStore: TokenStore, email: String): Boolean {
         val account = accounts.firstOrNull { it.email == email.trim().lowercase() } ?: return false
         tokenStore.saveAuth(
@@ -117,6 +173,7 @@ class AccountVault(context: Context) {
 
     /** Persists the (possibly refreshed) live session back into the vault. */
     fun syncActiveFrom(tokenStore: TokenStore) {
+        if (loginInProgress) return // the live session belongs to a brand-new login
         val auth = tokenStore.loadAuth() ?: return
         val email = activeEmail.ifBlank { return }
         updateTokens(email, auth)
@@ -130,8 +187,29 @@ class AccountVault(context: Context) {
         if (accounts.isNotEmpty()) return
         val auth = tokenStore.loadAuth() ?: return
         if (auth.refreshToken.isNullOrBlank()) return
-        upsert(StoredAccount(email = "اکانت اصلی", accessToken = auth.accessToken, refreshToken = auth.refreshToken, expiresAtEpochSeconds = auth.expiresAtEpochSeconds, addedAtEpochSeconds = System.currentTimeMillis() / 1000))
+        upsert(
+            StoredAccount(
+                email = LEGACY_LABEL,
+                accessToken = auth.accessToken,
+                refreshToken = auth.refreshToken,
+                expiresAtEpochSeconds = auth.expiresAtEpochSeconds,
+                addedAtEpochSeconds = System.currentTimeMillis() / 1000,
+                pendingIdentity = true,
+            ),
+        )
         AppLogger.i(TAG, "migrated the legacy single session into the vault")
+    }
+
+    /** Two rows pointing at the same identity keep the fresher tokens. */
+    private fun dedupe(list: List<StoredAccount>): List<StoredAccount> {
+        val seen = LinkedHashMap<String, StoredAccount>()
+        list.forEach { row ->
+            val prev = seen[row.email]
+            if (prev == null || row.expiresAtEpochSeconds >= prev.expiresAtEpochSeconds) {
+                seen[row.email] = row
+            }
+        }
+        return seen.values.toList()
     }
 
     private fun persist(list: List<StoredAccount>) {
@@ -143,7 +221,8 @@ class AccountVault(context: Context) {
                     .put("access", a.accessToken)
                     .put("refresh", a.refreshToken.orEmpty())
                     .put("expires", a.expiresAtEpochSeconds)
-                    .put("added", a.addedAtEpochSeconds),
+                    .put("added", a.addedAtEpochSeconds)
+                    .put("pending", a.pendingIdentity),
             )
         }
         prefs.edit().putString(KEY_ACCOUNTS, arr.toString()).apply()
@@ -152,5 +231,6 @@ class AccountVault(context: Context) {
     companion object {
         private const val KEY_ACCOUNTS = "accounts"
         private const val KEY_ACTIVE = "active_email"
+        const val LEGACY_LABEL = "اکانت اصلی"
     }
 }
