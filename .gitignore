@@ -1,4 +1,4 @@
-*.jks
+
 local.properties
 .gradle/
 build/

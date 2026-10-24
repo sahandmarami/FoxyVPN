@@ -1,3 +1,4 @@
+import java.util.Base64
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -5,9 +6,24 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-// The Ed25519 private key is injected at build time and is NOT part of the
-// published source:  ./gradlew assembleRelease -PFOXY_PRIVATE_KEY=<base64>
-val foxyPrivateKey: String = (project.findProperty("FOXY_PRIVATE_KEY") as String?) ?: ""
+// The Ed25519 quota-signing private key lives (lightly obfuscated) in
+// signing/signing-key.sec so rebuilds never lose it; a -PFOXY_PRIVATE_KEY=
+// <base64> override is still honoured for manual rotations.
+val foxyPrivateKey: String = (project.findProperty("FOXY_PRIVATE_KEY") as String?)
+    ?: run {
+        val secFile = rootProject.file("signing/signing-key.sec")
+        if (!secFile.exists()) {
+            ""
+        } else {
+            runCatching {
+                val data = Base64.getDecoder().decode(secFile.readText().trim().reversed())
+                val key = "FoxyVPN-2026-signing".toByteArray(Charsets.UTF_8)
+                val out = ByteArray(data.size)
+                for (i in data.indices) out[i] = (data[i].toInt() xor key[i % key.size].toInt()).toByte()
+                Base64.getEncoder().encodeToString(out)
+            }.getOrDefault("")
+        }
+    }
 
 android {
     namespace = "com.foxy.keygen"
@@ -17,8 +33,8 @@ android {
         applicationId = "com.foxy.keygen"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
         buildConfigField("String", "FOXY_PRIVATE_KEY", "\"$foxyPrivateKey\"")
     }
 

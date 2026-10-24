@@ -13,19 +13,20 @@ data class QuotaKeyPayload(
     val v: Int = 1,
     val name: String = "",
     val gb: Long = 0L,
+    val mb: Long = 0L,
     val exp: Long = 0L,
     val id: String = "",
     val rt: String = "",
     val gist: String = "",
     val gt: String = "",
 ) {
-    val isUnlimited: Boolean get() = gb <= 0L
+    val isUnlimited: Boolean get() = gb <= 0L && mb <= 0L
 }
 
 object QuotaKeyCodec {
 
-    /** Matches the public key embedded in the FoxyVPN client. */
-    const val PUB_B64 = "8b705IT0MNKJEXm+zwlKjlGiFazvWIkIoIYLR12cAvE="
+    /** Must match the public key embedded in the FoxyVPN client. */
+    const val PUB_B64 = "hA5+kmj6X7JrqYWraZQY+q09q72mNUJx2aLPNnX/Ntw="
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -35,6 +36,7 @@ object QuotaKeyCodec {
     fun mint(
         name: String,
         gb: Long,
+        mb: Long = 0L,
         expiresAtEpochSeconds: Long,
         refreshToken: String,
         gistId: String,
@@ -46,6 +48,7 @@ object QuotaKeyCodec {
             v = 1,
             name = name,
             gb = gb,
+            mb = mb,
             exp = expiresAtEpochSeconds,
             id = randomId(),
             rt = refreshToken,

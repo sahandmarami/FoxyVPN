@@ -23,10 +23,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.Button
@@ -34,7 +37,10 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -68,6 +74,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.foxy.keygen.data.AccountVault
+import com.foxy.keygen.data.ControlPlaneHttp
+import com.foxy.keygen.data.FxaAuthRepository
 import com.foxy.keygen.data.GistRegistry
 import com.foxy.keygen.data.QuotaKeyCodec
 import com.foxy.keygen.data.formatBytes
@@ -75,8 +84,10 @@ import com.foxy.keygen.ui.KeygenTheme
 import com.foxy.keygen.ui.fieldColors
 import com.foxy.keygen.ui.rememberKeygenAccent
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -99,18 +110,38 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun KeygenRoot(app: KeygenApp) {
-    var signedIn by remember { mutableStateOf(app.tokenStore.hasStoredSession()) }
-    if (!signedIn) {
-        LoginScreen(app) { signedIn = true }
+    var loggedIn by remember { mutableStateOf(app.tokenStore.hasStoredSession()) }
+    var loginModeIsAdd by remember { mutableStateOf(false) }
+    var accountsVersion by remember { mutableIntStateOf(0) }
+    if (!loggedIn) {
+        LoginScreen(app, addMode = loginModeIsAdd, onSignedIn = { loggedIn = true; accountsVersion++ })
     } else {
-        HomeScreen(app) { signedIn = false }
+        HomeScreen(
+            app,
+            accountsVersion,
+            onAccountsChanged = { accountsVersion++ },
+            onAddAccount = { loginModeIsAdd = true; loggedIn = false },
+            onSignOutActive = {
+                val active = app.accountVault.activeAccount()
+                if (active != null) app.accountVault.remove(active.email)
+                app.tokenStore.clear()
+                val next = app.accountVault.activeAccount()
+                if (next != null) {
+                    app.accountVault.activateInto(app.tokenStore, next.email)
+                } else {
+                    loginModeIsAdd = false
+                    loggedIn = false
+                }
+                accountsVersion++
+            },
+        )
     }
 }
 
 // ---------------- login ----------------
 
 @Composable
-private fun LoginScreen(app: KeygenApp, onSignedIn: () -> Unit) {
+private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: () -> Unit) {
     val accent = rememberKeygenAccent()
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
@@ -142,7 +173,8 @@ private fun LoginScreen(app: KeygenApp, onSignedIn: () -> Unit) {
         Spacer(Modifier.height(16.dp))
         Text("FoxyKeygen", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color(0xFF17222C))
         Text(
-            "برای ساخت کلید، با حساب فایرفاکس خود وارد شوید",
+            if (addMode) "اکانت فایرفاکس دیگری را برای ساخت کلید با سهمیهٔ آن وارد کنید"
+            else "برای ساخت کلید، با حساب فایرفاکس خود وارد شوید",
             fontSize = 13.sp,
             color = Color(0xFF67737F),
             textAlign = TextAlign.Center,
@@ -194,6 +226,21 @@ private fun LoginScreen(app: KeygenApp, onSignedIn: () -> Unit) {
                                 return@launch
                             }
                         }
+                        // record the account in the multi-account vault
+                        val auth = app.tokenStore.loadAuth()
+                        val realEmail = auth?.let { fetchFxaProfileEmail(it.accessToken) }
+                        val label = realEmail
+                            ?: FxaAuthRepository.normalizeEmail(email).takeIf { it.isNotBlank() }
+                            ?: "اکانت ${app.accountVault.accounts.size + 1}"
+                        app.accountVault.upsert(
+                            AccountVault.StoredAccount(
+                                email = label,
+                                accessToken = auth?.accessToken.orEmpty(),
+                                refreshToken = auth?.refreshToken,
+                                expiresAtEpochSeconds = auth?.expiresAtEpochSeconds ?: 0L,
+                                addedAtEpochSeconds = System.currentTimeMillis() / 1000L,
+                            ),
+                        )
                         onSignedIn()
                     } catch (c: CancellationException) {
                         throw c
@@ -218,9 +265,19 @@ private fun LoginScreen(app: KeygenApp, onSignedIn: () -> Unit) {
 // ---------------- home ----------------
 
 @Composable
-private fun HomeScreen(app: KeygenApp, onSignOut: () -> Unit) {
+private fun HomeScreen(
+    app: KeygenApp,
+    accountsVersion: Int,
+    onAccountsChanged: () -> Unit,
+    onAddAccount: () -> Unit,
+    onSignOutActive: () -> Unit,
+) {
     val accent = rememberKeygenAccent()
     var tab by remember { mutableIntStateOf(0) }
+    var menuOpen by remember { mutableStateOf(false) }
+
+    val accounts = remember(accountsVersion) { app.accountVault.accounts }
+    val activeEmail = remember(accountsVersion) { app.accountVault.activeAccount()?.email.orEmpty() }
 
     Scaffold(
         containerColor = Color(0xFFF6F8FB),
@@ -235,14 +292,62 @@ private fun HomeScreen(app: KeygenApp, onSignOut: () -> Unit) {
                 Spacer(Modifier.width(10.dp))
                 Text("FoxyKeygen", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color(0xFF17222C))
                 Spacer(Modifier.weight(1f))
-                IconButton(onClick = onSignOut) {
-                    Icon(Icons.Filled.Logout, contentDescription = "خروج", tint = Color(0xFF67737F))
+                // ---- account switcher ----
+                Box {
+                    OutlinedButton(
+                        onClick = { menuOpen = true },
+                        shape = RoundedCornerShape(50),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF17222C)),
+                    ) {
+                        Icon(Icons.Filled.People, contentDescription = null, modifier = Modifier.size(16.dp), tint = accent)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            if (accounts.size > 1) "${faDigits(accounts.size.toLong())} اکانت" else (activeEmail.ifBlank { "اکانت" }).take(22),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        accounts.forEach { account ->
+                            DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            account.email,
+                                            fontSize = 12.sp,
+                                            fontWeight = if (account.email == activeEmail) FontWeight.Bold else FontWeight.Normal,
+                                        )
+                                        Spacer(Modifier.weight(1f))
+                                        if (account.email == activeEmail) {
+                                            Icon(Icons.Filled.Check, contentDescription = "فعال", tint = accent, modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    app.accountVault.activateInto(app.tokenStore, account.email)
+                                    menuOpen = false
+                                    onAccountsChanged()
+                                },
+                            )
+                        }
+                        HorizontalDivider()
+                        DropdownMenuItem(
+                            text = { Text("افزودن اکانت جدید", fontSize = 12.sp) },
+                            leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp), tint = accent) },
+                            onClick = { menuOpen = false; onAddAccount() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("خروج از اکانت فعال", fontSize = 12.sp) },
+                            leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color(0xFFB72749)) },
+                            onClick = { menuOpen = false; onSignOutActive() },
+                        )
+                    }
                 }
             }
         },
     ) { padding ->
         Column(Modifier.padding(padding)) {
-            AccountQuotaCard(app)
+            AccountQuotaCard(app, accountsVersion)
             TabRow(
                 selectedTabIndex = tab,
                 containerColor = Color.Transparent,
@@ -251,20 +356,22 @@ private fun HomeScreen(app: KeygenApp, onSignOut: () -> Unit) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("ساخت کلید") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("کلیدهای من") })
             }
-            if (tab == 0) IssueTab(app) else KeysTab(app)
+            if (tab == 0) IssueTab(app, accountsVersion) else KeysTab(app)
         }
     }
 }
 
 @Composable
-private fun AccountQuotaCard(app: KeygenApp) {
+private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int) {
     val accent = rememberKeygenAccent()
+    val activeEmail = remember(accountsVersion) { app.accountVault.activeAccount()?.email.orEmpty() }
     var maxBytes by remember { mutableStateOf<Long?>(null) }
     var remaining by remember { mutableStateOf<Long?>(null) }
     var err by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(activeEmail) {
         while (true) {
+            app.accountVault.syncActiveFrom(app.tokenStore)
             val token = app.authRepository.currentAccessToken()
             if (token != null) {
                 runCatching { app.guardianClient.fetchUserInfo(KeygenApp.GUARDIAN_ENDPOINT, token) }
@@ -288,7 +395,11 @@ private fun AccountQuotaCard(app: KeygenApp) {
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
     ) {
         Column(Modifier.padding(14.dp)) {
-            Text("مجموع اکانت فایرفاکس شما", fontSize = 12.sp, color = Color(0xFF67737F))
+            Text(
+                if (activeEmail.isBlank()) "سهمیهٔ اکانت" else "سهمیهٔ اکانت $activeEmail",
+                fontSize = 12.sp,
+                color = Color(0xFF67737F),
+            )
             Spacer(Modifier.height(4.dp))
             Text(
                 text = when {
@@ -317,17 +428,19 @@ private fun AccountQuotaCard(app: KeygenApp) {
 // ---------------- issue tab ----------------
 
 @Composable
-private fun IssueTab(app: KeygenApp) {
+private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
     val accent = rememberKeygenAccent()
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
+    val activeAccountEmail = remember(accountsVersion) { app.accountVault.activeAccount()?.email.orEmpty() }
 
     var ghToken by remember { mutableStateOf(app.gistRegistry.githubToken) }
     var ghStatus by remember { mutableStateOf(if (app.gistRegistry.isReady) "مخزن گزارش متصل است ✓" else "") }
     var ghBusy by remember { mutableStateOf(false) }
 
     var name by remember { mutableStateOf("") }
-    var gbText by remember { mutableStateOf("5") }
+    var sizeText by remember { mutableStateOf("5") }
+    var sizeUnit by remember { mutableStateOf("گیگابایت") }
     var unlimited by remember { mutableStateOf(false) }
     var durationValue by remember { mutableStateOf("1") }
     var durationUnit by remember { mutableStateOf("ماه") }
@@ -426,9 +539,9 @@ private fun IssueTab(app: KeygenApp) {
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(
-                        value = gbText,
-                        onValueChange = { gbText = it.filter { ch -> ch.isDigit() }.take(5) },
-                        label = { Text("حجم (گیگابایت)") },
+                        value = sizeText,
+                        onValueChange = { sizeText = it.filter { ch -> ch.isDigit() }.take(6) },
+                        label = { Text(if (sizeUnit == "گیگابایت") "حجم (گیگابایت)" else "حجم (مگابایت)") },
                         modifier = Modifier.weight(1f), singleLine = true,
                         enabled = !unlimited,
                         shape = RoundedCornerShape(12.dp), colors = fieldColors(accent),
@@ -439,6 +552,24 @@ private fun IssueTab(app: KeygenApp) {
                         onClick = { unlimited = !unlimited },
                         label = { Text("نامحدود") },
                     )
+                }
+                if (!unlimited) {
+                    Spacer(Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("واحد:", fontSize = 12.sp, color = Color(0xFF67737F))
+                        Spacer(Modifier.width(8.dp))
+                        FilterChip(
+                            selected = sizeUnit == "گیگابایت",
+                            onClick = { sizeUnit = "گیگابایت" },
+                            label = { Text("گیگابایت") },
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        FilterChip(
+                            selected = sizeUnit == "مگابایت",
+                            onClick = { sizeUnit = "مگابایت" },
+                            label = { Text("مگابایت") },
+                        )
+                    }
                 }
                 Spacer(Modifier.height(10.dp))
 
@@ -473,16 +604,28 @@ private fun IssueTab(app: KeygenApp) {
                     Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                 }
 
+                if (activeAccountEmail.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "کلید از سهمیهٔ اکانت «$activeAccountEmail» کسر می‌شود — با منوی بالای صفحه عوضش کنید",
+                        fontSize = 10.sp,
+                        color = Color(0xFF97A1AC),
+                    )
+                }
+
                 Spacer(Modifier.height(14.dp))
                 Button(
                     onClick = {
                         busy = true; error = null; issuedKey = null
                         scope.launch {
                             try {
+                                app.accountVault.syncActiveFrom(app.tokenStore)
                                 val refreshToken = app.tokenStore.loadAuth()?.refreshToken
                                     ?: throw Exception("نشست فایرفاکس یافت نشد؛ دوباره وارد شوید")
-                                val gb = if (unlimited) 0L else gbText.toLongOrNull()?.coerceAtLeast(1L)
-                                    ?: throw Exception("حجم را درست وارد کنید")
+                                val sizeValue = sizeText.toLongOrNull()?.coerceAtLeast(1L)
+                                if (!unlimited && sizeValue == null) throw Exception("حجم را درست وارد کنید")
+                                val gb = if (unlimited || sizeUnit == "مگابایت") 0L else sizeValue ?: 0L
+                                val mb = if (unlimited || sizeUnit == "گیگابایت") 0L else sizeValue ?: 0L
                                 val unitSeconds = when (durationUnit) {
                                     "ساعت" -> 3600L
                                     "روز" -> 86400L
@@ -494,6 +637,7 @@ private fun IssueTab(app: KeygenApp) {
                                 val key = QuotaKeyCodec.mint(
                                     name = name.trim().ifBlank { "کاربر" },
                                     gb = gb,
+                                    mb = mb,
                                     expiresAtEpochSeconds = exp,
                                     refreshToken = refreshToken,
                                     gistId = app.gistRegistry.gistId,
@@ -504,7 +648,7 @@ private fun IssueTab(app: KeygenApp) {
                                 app.gistRegistry.addKey(
                                     GistRegistry.KeyRow(
                                         id = extractId(key), name = name.trim().ifBlank { "کاربر" },
-                                        gb = gb, exp = exp,
+                                        gb = gb, mb = mb, exp = exp,
                                         issuedAt = System.currentTimeMillis() / 1000L,
                                         revoked = false,
                                     ),
@@ -572,6 +716,24 @@ private fun extractId(key: String): String = QuotaKeyCodec.randomId().let {
         )
         org.json.JSONObject(jsonText).optString("id")
     }.getOrDefault(it)
+}
+
+/** Resolves the real e-mail of the freshly signed-in account (best effort). */
+private suspend fun fetchFxaProfileEmail(accessToken: String): String? = withContext(Dispatchers.IO) {
+    runCatching {
+        val request = okhttp3.Request.Builder()
+            .url("https://profile.accounts.firefox.com/v1/profile")
+            .header("Authorization", "Bearer $accessToken")
+            .header("User-Agent", "FoxyKeygen")
+            .get()
+            .build()
+        ControlPlaneHttp.client.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) return@use null
+            val body = resp.body?.string().orEmpty()
+            val email = org.json.JSONObject(body).optString("email")
+            email.takeIf { it.isNotBlank() }
+        }
+    }.getOrNull()
 }
 
 // ---------------- keys tab ----------------
@@ -695,7 +857,13 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
             Spacer(Modifier.height(6.dp))
             Text(
                 buildString {
-                    append(if (row.gb > 0) "${row.gb} گیگابایت" else "نامحدود")
+                    append(
+                        when {
+                            row.gb > 0 -> "${row.gb} گیگابایت"
+                            row.mb > 0 -> "${row.mb} مگابایت"
+                            else -> "نامحدود"
+                        },
+                    )
                     if (row.exp > 0) {
                         append("  ·  اعتبار تا " + formatDate(row.exp))
                         append("  ·  " + remainingLabel(row.exp, System.currentTimeMillis()))
@@ -711,10 +879,10 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
                 fontWeight = FontWeight.SemiBold,
                 color = Color(0xFF17222C),
             )
-            if (row.gb > 0) {
+            if (row.planBytes > 0) {
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
-                    progress = { (row.usedBytes.toFloat() / (row.gb * 1_000_000_000L).toFloat()).coerceIn(0f, 1f) },
+                    progress = { (row.usedBytes.toFloat() / row.planBytes.toFloat()).coerceIn(0f, 1f) },
                     modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
                     color = if (row.revoked) Color(0xFFB72749) else accent,
                     trackColor = Color(0xFFEDF1F5),

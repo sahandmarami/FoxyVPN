@@ -22,17 +22,24 @@ data class QuotaKeyPayload(
     val v: Int = 1,
     val name: String = "",
     val gb: Long = 0L,
+    val mb: Long = 0L,
     val exp: Long = 0L,
     val id: String = "",
     val rt: String = "",
     val gist: String = "",
     val gt: String = "",
 ) {
-    val isUnlimited: Boolean get() = gb <= 0L
-    val limitBytes: Long get() = if (isUnlimited) 0L else gb * BYTES_PER_GB
+    val isUnlimited: Boolean get() = gb <= 0L && mb <= 0L
+    val limitBytes: Long
+        get() = when {
+            gb > 0L -> gb * BYTES_PER_GB
+            mb > 0L -> mb * BYTES_PER_MB
+            else -> 0L
+        }
 
     companion object {
         const val BYTES_PER_GB: Long = 1_000_000_000L
+        const val BYTES_PER_MB: Long = 1_000_000L
     }
 }
 
@@ -45,7 +52,7 @@ object QuotaKeyCodec {
 
     /** Ed25519 public key of the distributor's FoxyKeygen (base64, 32 bytes). */
     const val PUB_B64 =
-        "XxKVqJEz37vADD0ctmZSGPgvnS/o+1FCFf7CB1J3++E="
+        "hA5+kmj6X7JrqYWraZQY+q09q72mNUJx2aLPNnX/Ntw="
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 

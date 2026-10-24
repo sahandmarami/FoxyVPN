@@ -52,6 +52,13 @@ class FxaAuthRepository(
     private val tokenStore: TokenStore,
     private val challengeSolver: FastlyChallengeSolver = FastlyChallengeSolver(ControlPlaneHttp.cookieJar),
 ) {
+
+    /** Fired whenever the live session tokens change (login / refresh grant). */
+    var onAuthSaved: (() -> Unit)? = null
+
+    private fun notifyAuthSaved() {
+        runCatching { onAuthSaved?.invoke() }
+    }
     var pendingSessionToken: String?
         get() = tokenStore.pendingSessionToken
         set(value) { tokenStore.pendingSessionToken = value }
@@ -188,6 +195,7 @@ class FxaAuthRepository(
         )
         runCatching { tokenStore.saveAuth(renewed) }
             .onFailure { AppLogger.w(TAG, "could not persist the renewed token", it) }
+        notifyAuthSaved()
         return renewed
     }
 
@@ -227,6 +235,7 @@ class FxaAuthRepository(
                 expiresAtEpochSeconds = expiryFrom(tokenData),
             ),
         )
+        notifyAuthSaved()
         clearPendingSession()
     }
 

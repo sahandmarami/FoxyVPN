@@ -191,6 +191,7 @@ fun HomeScreen(
                 AccountCard(
                     appName = key?.personName ?: "کاربر",
                     planGb = key?.payload?.gb ?: 0L,
+                    planMb = key?.payload?.mb ?: 0L,
                     expiresAt = key?.payload?.exp ?: 0L,
                     usedBytes = usedBytes,
                     accent = palette.accent,
@@ -422,6 +423,7 @@ fun HomeScreen(
 private fun AccountCard(
     appName: String,
     planGb: Long,
+    planMb: Long,
     expiresAt: Long,
     usedBytes: Long,
     accent: Color,
@@ -461,7 +463,11 @@ private fun AccountCard(
                 Column(Modifier.weight(1f)) {
                     Text(appName, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF20303C))
                     Text(
-                        if (planGb > 0) "اشتراک $planGb گیگابایتی فعال است ✓" else "اشتراک نامحدود فعال است ✓",
+                        when {
+                            planGb > 0 -> "اشتراک $planGb گیگابایتی فعال است ✓"
+                            planMb > 0 -> "اشتراک $planMb مگابایتی فعال است ✓"
+                            else -> "اشتراک نامحدود فعال است ✓"
+                        },
                         fontSize = 12.sp,
                         color = accentDeep,
                     )
@@ -483,9 +489,10 @@ private fun AccountCard(
                 }
             }
 
-            if (planGb > 0) {
+            val planBytes = planGb * QuotaKeyPayload.BYTES_PER_GB + planMb * QuotaKeyPayload.BYTES_PER_MB
+            if (planBytes > 0) {
                 Spacer(Modifier.height(12.dp))
-                val limitBytes = planGb * QuotaKeyPayload.BYTES_PER_GB
+                val limitBytes = planBytes
                 val fraction = (usedBytes.toFloat() / limitBytes.toFloat()).coerceIn(0f, 1f)
                 LinearProgressIndicator(
                     progress = { fraction },
@@ -498,7 +505,7 @@ private fun AccountCard(
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "${formatBytes(usedBytes)} از $planGb گیگ مصرف شده",
+                    "${formatBytes(usedBytes)} از ${formatBytes(planBytes)} مصرف شده",
                     fontSize = 11.sp,
                     color = Color(0xFF7A8794),
                 )

@@ -23,13 +23,22 @@ class GistRegistry(context: Context) {
         val id: String,
         val name: String,
         val gb: Long,
+        val mb: Long = 0L,
         val exp: Long,
         val issuedAt: Long,
         val revoked: Boolean,
         val usedBytes: Long = 0L,
         val status: String = "",
         val updatedAt: Long = 0L,
-    )
+    ) {
+        /** Total plan bytes: GB entries win, otherwise MB, otherwise unlimited (0). */
+        val planBytes: Long
+            get() = when {
+                gb > 0L -> gb * 1_000_000_000L
+                mb > 0L -> mb * 1_000_000L
+                else -> 0L
+            }
+    }
 
     private val prefs = context.getSharedPreferences("foxykeygen_settings", Context.MODE_PRIVATE)
 
@@ -104,6 +113,7 @@ class GistRegistry(context: Context) {
                     id = id,
                     name = entry.optString("name"),
                     gb = entry.optLong("gb"),
+                    mb = entry.optLong("mb"),
                     exp = entry.optLong("exp"),
                     issuedAt = entry.optLong("issued"),
                     revoked = entry.optBoolean("revoked", false),
@@ -125,6 +135,7 @@ class GistRegistry(context: Context) {
                 .put("id", row.id)
                 .put("name", row.name)
                 .put("gb", row.gb)
+                .put("mb", row.mb)
                 .put("exp", row.exp)
                 .put("issued", row.issuedAt)
                 .put("revoked", false),

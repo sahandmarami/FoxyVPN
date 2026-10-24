@@ -99,6 +99,7 @@ private object QuotaKeyJson {
             .put("v", p.v)
             .put("name", p.name)
             .put("gb", p.gb)
+            .put("mb", p.mb)
             .put("exp", p.exp)
             .put("id", p.id)
             .put("rt", "") // never persist the refresh token outside the encrypted TokenStore
