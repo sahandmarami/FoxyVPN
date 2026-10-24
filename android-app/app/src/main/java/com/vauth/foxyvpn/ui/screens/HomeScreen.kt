@@ -427,6 +427,14 @@ private fun AccountCard(
     accent: Color,
     accentDeep: Color,
 ) {
+    // live clock so the remaining-days label falls on its own, day after day
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000L)
+            nowMs = System.currentTimeMillis()
+        }
+    }
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -457,6 +465,14 @@ private fun AccountCard(
                         fontSize = 12.sp,
                         color = accentDeep,
                     )
+                    if (expiresAt > 0) {
+                        Text(
+                            remainingLabel(expiresAt, nowMs),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (expiresAt * 1000L > nowMs) accentDeep else Color(0xFFB72749),
+                        )
+                    }
                 }
                 if (expiresAt > 0) {
                     Text(
@@ -635,3 +651,25 @@ private fun formatDate(epochSeconds: Long): String = runCatching {
     val formatter = DateTimeFormatter.ofPattern("d MMMM yyyy", Locale("fa"))
     formatter.format(Instant.ofEpochSecond(epochSeconds).atZone(ZoneId.systemDefault()).toLocalDate())
 }.getOrDefault("")
+
+/** Persian digit rendering for the countdown numbers. */
+private fun faDigits(n: Long): String = buildString {
+    for (ch in n.toString()) append(if (ch in '0'..'9') ('۰'.code + (ch - '0')) else ch)
+}
+
+/**
+ * Human "time left on the key" label, recalculated live so the day count
+ * drops on its own as days pass.
+ */
+private fun remainingLabel(expiresAtEpochSec: Long, nowMillis: Long): String {
+    val remainingMs = expiresAtEpochSec * 1000L - nowMillis
+    if (remainingMs <= 0L) return "اعتبار تمام شده"
+    val totalMinutes = remainingMs / 60_000L
+    val hours = totalMinutes / 60
+    val days = hours / 24
+    return when {
+        days >= 1 -> "${faDigits(days)} روز باقی‌مانده"
+        hours >= 1 -> "${faDigits(hours)} ساعت باقی‌مانده"
+        else -> "کمتر از یک ساعت باقی‌مانده"
+    }
+}

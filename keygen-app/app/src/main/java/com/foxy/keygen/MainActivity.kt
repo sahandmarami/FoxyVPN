@@ -696,7 +696,10 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
             Text(
                 buildString {
                     append(if (row.gb > 0) "${row.gb} گیگابایت" else "نامحدود")
-                    if (row.exp > 0) append("  ·  اعتبار تا " + formatDate(row.exp))
+                    if (row.exp > 0) {
+                        append("  ·  اعتبار تا " + formatDate(row.exp))
+                        append("  ·  " + remainingLabel(row.exp, System.currentTimeMillis()))
+                    }
                 },
                 fontSize = 11.sp,
                 color = Color(0xFF67737F),
@@ -725,6 +728,14 @@ private fun KeyRowCard(row: GistRegistry.KeyRow, busy: Boolean, onToggle: () -> 
             ) {
                 Text(if (row.revoked) "فعال‌سازی دوباره" else "باطل‌کردن کلید", fontSize = 12.sp)
             }
+            if (!row.revoked) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "باطل‌سازی تا حدود یک دقیقه بعد روی گوشی کاربر اعمال می‌شود",
+                    fontSize = 10.sp,
+                    color = Color(0xFF97A1AC),
+                )
+            }
         }
     }
 }
@@ -733,6 +744,25 @@ private fun formatDate(epochSeconds: Long): String = runCatching {
     DateTimeFormatter.ofPattern("d MMM yyyy", Locale("fa"))
         .format(Instant.ofEpochSecond(epochSeconds).atZone(ZoneId.systemDefault()).toLocalDate())
 }.getOrDefault("")
+
+/** Persian digits for the day/hour countdown. */
+private fun faDigits(n: Long): String = buildString {
+    for (ch in n.toString()) append(if (ch in '0'..'9') ('۰'.code + (ch - '0')) else ch)
+}
+
+/** "چند روز تا تمدید/پایان اعتبار این کلید باقی است" — recalculated live. */
+private fun remainingLabel(expiresAtEpochSec: Long, nowMillis: Long): String {
+    val remainingMs = expiresAtEpochSec * 1000L - nowMillis
+    if (remainingMs <= 0L) return "اعتبار تمام شده"
+    val totalMinutes = remainingMs / 60_000L
+    val hours = totalMinutes / 60
+    val days = hours / 24
+    return when {
+        days >= 1 -> "${faDigits(days)} روز تا تمدید"
+        hours >= 1 -> "${faDigits(hours)} ساعت تا تمدید"
+        else -> "کمتر از یک ساعت تا تمدید"
+    }
+}
 
 private fun formatTime(epochSeconds: Long): String = runCatching {
     DateTimeFormatter.ofPattern("HH:mm", Locale.US)

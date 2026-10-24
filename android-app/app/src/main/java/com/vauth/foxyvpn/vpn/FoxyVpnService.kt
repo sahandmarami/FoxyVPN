@@ -61,6 +61,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class VpnLiveStats(
     val txRateBytesPerSec: Long = 0L,
@@ -112,8 +113,12 @@ private const val WAKE_LOCK_TAG = "com.vauth.foxyvpn:vpn"
 private const val WIFI_LOCK_TAG = "com.vauth.foxyvpn:vpn-wifi"
 
 private const val KEY_SUPERVISION_TICK_MS = 2_000L
-private const val USAGE_REPORT_INTERVAL_MS = 3 * 60_000L
-private const val REVOKE_POLL_INTERVAL_MS = 6 * 60_000L
+
+/** One gist round trip per interval: revocation check + live usage report. */
+private const val KEY_GIST_SYNC_INTERVAL_MS = 30_000L
+
+/** Revocation re-check budget before opening a new tunnel. */
+private const val CONNECT_GIST_CHECK_TIMEOUT_MS = 8_000L
 
 private fun fullJitterBackoffMs(attempt: Int, baseMs: Long, capMs: Long): Long {
     val exponential = baseMs * (1L shl attempt.coerceIn(0, 10))
@@ -350,6 +355,22 @@ class FoxyVpnService : VpnService() {
 
             acquireWakeLocks()
             connectJob = scope.launch {
+                // re-check the registry before opening a new tunnel so a revoked
+                // key never gets a fresh session, not even for a few minutes
+                val keyCtx = UsageAccountant.reporterContext()
+                if (keyCtx != null) {
+                    val revoked = runCatching {
+                        withTimeoutOrNull(CONNECT_GIST_CHECK_TIMEOUT_MS) { GistReporter.isRevoked(keyCtx) }
+                    }.getOrNull() == true
+                    if (revoked) {
+                        UsageAccountant.markRevoked()
+                        _lastError.value = keyBlockMessage(UsageAccountant.BlockReason.REVOKED)
+                        AppLogger.w(TAG, "connect aborted: the gist registry marks this key revoked")
+                        scope.launch { runCatching { UsageAccountant.reportNow() } }
+                        requestDisconnect("key revoked")
+                        return@launch
+                    }
+                }
                 launchKeySupervision()
                 opMutex.withLock { connect() }
             }
@@ -1172,29 +1193,44 @@ class FoxyVpnService : VpnService() {
         keySupervisionJob?.cancel()
         if (!UsageAccountant.keyAttached()) return
         keySupervisionJob = scope.launch {
-            var revokedPollAt = 0L
-            var reportedAt = 0L
-            while (isActive && _state.value != ConnectionState.DISCONNECTED) {
-                val now = System.currentTimeMillis()
-                if (UsageAccountant.blockReason != UsageAccountant.BlockReason.NONE) {
-                    _lastError.value = keyBlockMessage(UsageAccountant.blockReason)
-                    AppLogger.w(TAG, "quota key reached its limit mid-session: ${UsageAccountant.blockReason}")
-                    requestDisconnect("quota key reached its limit")
-                    return@launch
-                }
-                if (now - revokedPollAt > REVOKE_POLL_INTERVAL_MS) {
-                    revokedPollAt = now
-                    val ctx = UsageAccountant.reporterContext()
-                    if (ctx != null && GistReporter.isRevoked(ctx)) {
-                        UsageAccountant.markRevoked()
-                        continue
+            var lastSyncAt = 0L
+            try {
+                while (isActive && _state.value != ConnectionState.DISCONNECTED) {
+                    val now = System.currentTimeMillis()
+                    if (UsageAccountant.blockReason != UsageAccountant.BlockReason.NONE) {
+                        _lastError.value = keyBlockMessage(UsageAccountant.blockReason)
+                        AppLogger.w(TAG, "quota key reached its limit mid-session: ${UsageAccountant.blockReason}")
+                        requestDisconnect("quota key reached its limit")
+                        return@launch
                     }
+                    // one combined round trip: registry (revoked?) + usage report;
+                    // keeps the distributor's dashboard within ~30s of this device
+                    if (now - lastSyncAt >= KEY_GIST_SYNC_INTERVAL_MS) {
+                        lastSyncAt = now
+                        val ctx = UsageAccountant.reporterContext()
+                        if (ctx != null) {
+                            val sync = runCatching {
+                                GistReporter.sync(
+                                    ctx = ctx,
+                                    usedBytes = UsageAccountant.used,
+                                    limitBytes = UsageAccountant.limit,
+                                    expired = UsageAccountant.blockReason == UsageAccountant.BlockReason.EXPIRED,
+                                )
+                            }.onFailure {
+                                AppLogger.d(TAG, "gist sync failed this tick: ${it.message}")
+                            }.getOrNull()
+                            if (sync?.revoked == true) {
+                                AppLogger.w(TAG, "gist registry marks this key revoked; disconnecting")
+                                UsageAccountant.markRevoked()
+                                continue
+                            }
+                        }
+                    }
+                    delay(KEY_SUPERVISION_TICK_MS)
                 }
-                if (now - reportedAt > USAGE_REPORT_INTERVAL_MS) {
-                    reportedAt = now
-                    runCatching { UsageAccountant.reportNow() }
-                }
-                delay(KEY_SUPERVISION_TICK_MS)
+            } finally {
+                // final report so the dashboard shows the last consumed byte
+                runCatching { UsageAccountant.reportNow() }
             }
         }
     }

@@ -45,7 +45,7 @@ object QuotaKeyCodec {
 
     /** Ed25519 public key of the distributor's FoxyKeygen (base64, 32 bytes). */
     const val PUB_B64 =
-        "8b705IT0MNKJEXm+zwlKjlGiFazvWIkIoIYLR12cAvE="
+        "XxKVqJEz37vADD0ctmZSGPgvnS/o+1FCFf7CB1J3++E="
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 

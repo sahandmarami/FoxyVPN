@@ -17,8 +17,8 @@ android {
         applicationId = "com.foxy.keygen"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
         buildConfigField("String", "FOXY_PRIVATE_KEY", "\"$foxyPrivateKey\"")
     }
 
@@ -26,7 +26,7 @@ android {
         create("release") {
             storeFile = rootProject.file("release-keystore.jks")
             storePassword = System.getenv("SIGNING_STORE_PASSWORD") ?: "foxyvpn"
-            keyAlias = "foxyvpn"
+            keyAlias = System.getenv("SIGNING_KEY_ALIAS") ?: "foxyvpn"
             keyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: "foxyvpn"
         }
     }
