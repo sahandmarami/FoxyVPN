@@ -50,9 +50,20 @@ data class QuotaKey(val payload: QuotaKeyPayload, val raw: String) {
 
 object QuotaKeyCodec {
 
-    /** Ed25519 public key of the distributor's FoxyKeygen (base64, 32 bytes). */
+    /** Ed25519 public key of the current FoxyKeygen release (base64, 32 bytes). */
     const val PUB_B64 =
         "hA5+kmj6X7JrqYWraZQY+q09q72mNUJx2aLPNnX/Ntw="
+
+    /**
+     * Every signing public key this build accepts: the current one first,
+     * then the earlier release keys — so keys already in our friends' hands
+     * keep working after an update and nobody has to re-issue them.
+     */
+    val PUB_B64_LIST = listOf(
+        PUB_B64,
+        "XxKVqJEz37vADD0ctmZSGPgvnS/o+1FCFf7CB1J3++E=", // v2.1.0 era
+        "8b705IT0MNKJEXm+zwlKjlGiFazvWIkIoIYLR12cAvE=", // original era
+    )
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
@@ -64,14 +75,17 @@ object QuotaKeyCodec {
         return b64urlEncode(signer.generateSignature())
     }
 
-    fun verify(payloadB64: String, signatureB64: String): Boolean = runCatching {
-        val pub = Base64.decode(PUB_B64, Base64.NO_WRAP)
-        val sig = b64urlDecode(signatureB64)
-        val verifier = Ed25519Signer()
-        verifier.init(false, Ed25519PublicKeyParameters(pub, 0))
-        verifier.update(payloadB64.toByteArray(Charsets.US_ASCII), 0, payloadB64.length)
-        verifier.verifySignature(sig)
-    }.getOrDefault(false)
+    fun verify(payloadB64: String, signatureB64: String): Boolean =
+        PUB_B64_LIST.any { pubB64 ->
+            runCatching {
+                val pub = Base64.decode(pubB64, Base64.NO_WRAP)
+                val sig = b64urlDecode(signatureB64)
+                val verifier = Ed25519Signer()
+                verifier.init(false, Ed25519PublicKeyParameters(pub, 0))
+                verifier.update(payloadB64.toByteArray(Charsets.US_ASCII), 0, payloadB64.length)
+                verifier.verifySignature(sig)
+            }.getOrDefault(false)
+        }
 
     fun encode(payload: QuotaKeyPayload, privateKeyB64: String): String {
         val payloadJson = json.encodeToString(QuotaKeyPayload.serializer(), payload)
